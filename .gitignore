@@ -1,0 +1,35 @@
+# 训练权重
+*.pth
+*.pt
+*.ckpt
+
+# 日志
+log/
+logs/
+*.log
+
+# 数据集
+data/
+dataset/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+
+# Jupyter
+*.ipynb_checkpoints/
+
+# Coverage
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
