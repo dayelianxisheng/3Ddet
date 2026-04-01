@@ -136,7 +136,7 @@ def main(args):
     criterion = criterion.to(device)
 
     try:
-        checkpoint = torch.load(str(exp_dir) + '/checkpoints/best_model.pth', map_location=device)
+        checkpoint = torch.load(str(exp_dir) + '/checkpoints/best_model.pth', map_location=device, weights_only=False)
         start_epoch = checkpoint['epoch']
         classifier.load_state_dict(checkpoint['model_state_dict'])
         log_string('Use pretrain model')
