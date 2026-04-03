@@ -10,7 +10,6 @@ logs/
 
 # 数据集
 data/
-dataset/
 
 # Python
 __pycache__/
