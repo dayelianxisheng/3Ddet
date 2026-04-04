@@ -1,22 +1,26 @@
-import argparse
-import os
-from dataset.S3DISDataLoader import S3DISDataset
-import torch
 import datetime
+import argparse
 import logging
-from pathlib import Path
-import sys
 import importlib
+import os
 import shutil
-from tqdm import tqdm
-import provider
-import numpy as np
+import sys
 import time
+from pathlib import Path
 
+import numpy as np
+import torch
+from tqdm import tqdm
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = BASE_DIR
-sys.path.append(os.path.join(ROOT_DIR, 'model'))
+BASE_DIR = Path(__file__).resolve().parent
+ROOT_DIR = BASE_DIR.parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.append(str(ROOT_DIR))
+if str(ROOT_DIR / 'model') not in sys.path:
+    sys.path.append(str(ROOT_DIR / 'model'))
+
+from dataset import provider
+from dataset.S3DISDataLoader import S3DISDataset
 
 classes = ['ceiling', 'floor', 'wall', 'beam', 'column', 'window', 'door', 'table', 'chair', 'sofa', 'bookcase',
            'board', 'clutter']
@@ -35,6 +39,7 @@ def inplace_relu(m):
 def parse_args():
     parser = argparse.ArgumentParser('Model')
     parser.add_argument('--model', type=str, default='pointnet_sem_seg', help='model name [default: pointnet_sem_seg]')
+    parser.add_argument('--use_cpu', action='store_true', default=False, help='use cpu mode')
     parser.add_argument('--batch_size', type=int, default=16, help='Batch Size during training [default: 16]')
     parser.add_argument('--epoch', default=32, type=int, help='Epoch to run [default: 32]')
     parser.add_argument('--learning_rate', default=0.001, type=float, help='Initial learning rate [default: 0.001]')
@@ -46,8 +51,29 @@ def parse_args():
     parser.add_argument('--step_size', type=int, default=10, help='Decay step for lr decay [default: every 10 epochs]')
     parser.add_argument('--lr_decay', type=float, default=0.7, help='Decay rate for lr decay [default: 0.7]')
     parser.add_argument('--test_area', type=int, default=5, help='Which area to use for test, option: 1-6 [default: 5]')
+    parser.add_argument(
+        '--data_root',
+        type=str,
+        default=str(ROOT_DIR / 'data' / 'stanford_indoor3d'),
+        help='Path to preprocessed S3DIS room .npy files [default: repo/data/stanford_indoor3d]',
+    )
+    parser.add_argument(
+        '--num_workers',
+        type=int,
+        default=0,
+        help='DataLoader worker count. Use >0 only when multiprocessing is stable in your environment [default: 0]',
+    )
 
     return parser.parse_args()
+
+
+def resolve_data_root(data_root):
+    candidate = Path(data_root).expanduser()
+    if not candidate.is_absolute():
+        candidate = (ROOT_DIR / candidate).resolve()
+    return candidate
+
+
 def main(args):
     def log_string(str):
         logger.info(str)
@@ -55,10 +81,11 @@ def main(args):
 
     '''HYPER PARAMETER'''
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    device = torch.device('cuda' if torch.cuda.is_available() and not args.use_cpu else 'cpu')
 
     '''CREATE DIR'''
     timestr = str(datetime.datetime.now().strftime('%Y-%m-%d_%H-%M'))
-    experiment_dir = Path('log/')
+    experiment_dir = BASE_DIR / 'log'
     experiment_dir.mkdir(exist_ok=True)
     experiment_dir = experiment_dir.joinpath('sem_seg')
     experiment_dir.mkdir(exist_ok=True)
@@ -73,9 +100,9 @@ def main(args):
     log_dir.mkdir(exist_ok=True)
 
     '''LOG'''
-    args = parse_args()
     logger = logging.getLogger("Model")
     logger.setLevel(logging.INFO)
+    logger.handlers = []
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     file_handler = logging.FileHandler('%s/%s.txt' % (log_dir, args.model))
     file_handler.setLevel(logging.INFO)
@@ -84,7 +111,7 @@ def main(args):
     log_string('PARAMETER ...')
     log_string(args)
 
-    root = 'data/stanford_indoor3d/'
+    root = resolve_data_root(args.data_root)
     NUM_CLASSES = 13
     NUM_POINT = args.npoint
     BATCH_SIZE = args.batch_size
@@ -94,23 +121,25 @@ def main(args):
     print("start loading test data ...")
     TEST_DATASET = S3DISDataset(split='test', data_root=root, num_point=NUM_POINT, test_area=args.test_area, block_size=1.0, sample_rate=1.0, transform=None)
 
-    trainDataLoader = torch.utils.data.DataLoader(TRAIN_DATASET, batch_size=BATCH_SIZE, shuffle=True, num_workers=10,
-                                                  pin_memory=True, drop_last=True,
+    trainDataLoader = torch.utils.data.DataLoader(TRAIN_DATASET, batch_size=BATCH_SIZE, shuffle=True, num_workers=args.num_workers,
+                                                  pin_memory=device.type == 'cuda', drop_last=True,
                                                   worker_init_fn=lambda x: np.random.seed(x + int(time.time())))
-    testDataLoader = torch.utils.data.DataLoader(TEST_DATASET, batch_size=BATCH_SIZE, shuffle=False, num_workers=10,
-                                                 pin_memory=True, drop_last=True)
-    weights = torch.Tensor(TRAIN_DATASET.labelweights).cuda()
+    testDataLoader = torch.utils.data.DataLoader(TEST_DATASET, batch_size=BATCH_SIZE, shuffle=False, num_workers=args.num_workers,
+                                                 pin_memory=device.type == 'cuda', drop_last=True)
+    weights = torch.as_tensor(TRAIN_DATASET.labelweights, dtype=torch.float32, device=device)
 
     log_string("The number of training data is: %d" % len(TRAIN_DATASET))
     log_string("The number of test data is: %d" % len(TEST_DATASET))
 
     '''MODEL LOADING'''
     MODEL = importlib.import_module(args.model)
-    shutil.copy('models/%s.py' % args.model, str(experiment_dir))
-    shutil.copy('models/pointnet2_utils.py', str(experiment_dir))
+    shutil.copy(ROOT_DIR / 'model' / ('%s.py' % args.model), str(experiment_dir))
+    encoder_src = ROOT_DIR / 'encoder' / 'pointnet.py'
+    if encoder_src.exists():
+        shutil.copy(encoder_src, str(experiment_dir))
 
-    classifier = MODEL.get_model(NUM_CLASSES).cuda()
-    criterion = MODEL.get_loss().cuda()
+    classifier = MODEL.get_model(NUM_CLASSES).to(device)
+    criterion = MODEL.get_loss().to(device)
     classifier.apply(inplace_relu)
 
     def weights_init(m):
@@ -122,12 +151,13 @@ def main(args):
             torch.nn.init.xavier_normal_(m.weight.data)
             torch.nn.init.constant_(m.bias.data, 0.0)
 
+    checkpoint_path = checkpoints_dir / 'best_model.pth'
     try:
-        checkpoint = torch.load(str(experiment_dir) + '/checkpoints/best_model.pth')
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         start_epoch = checkpoint['epoch']
         classifier.load_state_dict(checkpoint['model_state_dict'])
         log_string('Use pretrain model')
-    except:
+    except FileNotFoundError:
         log_string('No existing model, starting training from scratch...')
         start_epoch = 0
         classifier = classifier.apply(weights_init)
@@ -178,11 +208,11 @@ def main(args):
 
             points = points.data.numpy()
             points[:, :, :3] = provider.rotate_point_cloud_z(points[:, :, :3])
-            points = torch.Tensor(points)
-            points, target = points.float().cuda(), target.long().cuda()
+            points = torch.from_numpy(points)
+            points, target = points.float().to(device), target.long().to(device)
             points = points.transpose(2, 1)
 
-            seg_pred, trans_feat = classifier(points)
+            seg_pred, _, trans_feat = classifier(points)
             seg_pred = seg_pred.contiguous().view(-1, NUM_CLASSES)
 
             batch_label = target.view(-1, 1)[:, 0].cpu().data.numpy()
@@ -194,8 +224,8 @@ def main(args):
             pred_choice = seg_pred.cpu().data.max(1)[1].numpy()
             correct = np.sum(pred_choice == batch_label)
             total_correct += correct
-            total_seen += (BATCH_SIZE * NUM_POINT)
-            loss_sum += loss
+            total_seen += batch_label.size
+            loss_sum += loss.item()
         log_string('Training mean loss: %f' % (loss_sum / num_batches))
         log_string('Training accuracy: %f' % (total_correct / float(total_seen)))
 
@@ -226,22 +256,22 @@ def main(args):
             log_string('---- EPOCH %03d EVALUATION ----' % (global_epoch + 1))
             for i, (points, target) in tqdm(enumerate(testDataLoader), total=len(testDataLoader), smoothing=0.9):
                 points = points.data.numpy()
-                points = torch.Tensor(points)
-                points, target = points.float().cuda(), target.long().cuda()
+                points = torch.from_numpy(points)
+                points, target = points.float().to(device), target.long().to(device)
                 points = points.transpose(2, 1)
 
-                seg_pred, trans_feat = classifier(points)
+                seg_pred, _, trans_feat = classifier(points)
                 pred_val = seg_pred.contiguous().cpu().data.numpy()
                 seg_pred = seg_pred.contiguous().view(-1, NUM_CLASSES)
 
                 batch_label = target.cpu().data.numpy()
                 target = target.view(-1, 1)[:, 0]
                 loss = criterion(seg_pred, target, trans_feat, weights)
-                loss_sum += loss
+                loss_sum += loss.item()
                 pred_val = np.argmax(pred_val, 2)
                 correct = np.sum((pred_val == batch_label))
                 total_correct += correct
-                total_seen += (BATCH_SIZE * NUM_POINT)
+                total_seen += batch_label.size
                 tmp, _ = np.histogram(batch_label, range(NUM_CLASSES + 1))
                 labelweights += tmp
 
@@ -251,18 +281,19 @@ def main(args):
                     total_iou_deno_class[l] += np.sum(((pred_val == l) | (batch_label == l)))
 
             labelweights = labelweights.astype(np.float32) / np.sum(labelweights.astype(np.float32))
-            mIoU = np.mean(np.array(total_correct_class) / (np.array(total_iou_deno_class, dtype=np.float) + 1e-6))
+            mIoU = np.mean(np.array(total_correct_class) / (np.array(total_iou_deno_class, dtype=float) + 1e-6))
             log_string('eval mean loss: %f' % (loss_sum / float(num_batches)))
             log_string('eval point avg class IoU: %f' % (mIoU))
             log_string('eval point accuracy: %f' % (total_correct / float(total_seen)))
             log_string('eval point avg class acc: %f' % (
-                np.mean(np.array(total_correct_class) / (np.array(total_seen_class, dtype=np.float) + 1e-6))))
+                np.mean(np.array(total_correct_class) / (np.array(total_seen_class, dtype=float) + 1e-6))))
 
             iou_per_class_str = '------- IoU --------\n'
             for l in range(NUM_CLASSES):
+                class_iou = total_correct_class[l] / float(total_iou_deno_class[l]) if total_iou_deno_class[l] else 0.0
                 iou_per_class_str += 'class %s weight: %.3f, IoU: %.3f \n' % (
-                    seg_label_to_cat[l] + ' ' * (14 - len(seg_label_to_cat[l])), labelweights[l - 1],
-                    total_correct_class[l] / float(total_iou_deno_class[l]))
+                    seg_label_to_cat[l] + ' ' * (14 - len(seg_label_to_cat[l])), labelweights[l],
+                    class_iou)
 
             log_string(iou_per_class_str)
             log_string('Eval mean loss: %f' % (loss_sum / num_batches))

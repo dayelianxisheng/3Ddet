@@ -11,12 +11,31 @@ class S3DISDataset(Dataset):
         self.num_point = num_point
         self.block_size = block_size
         self.transform = transform
-        rooms = sorted(os.listdir(data_root))
-        rooms = [room for room in rooms if 'Area_' in room]
+        if not os.path.isdir(data_root):
+            raise FileNotFoundError(f'S3DIS data_root does not exist: {data_root}')
+        entries = sorted(os.listdir(data_root))
+        rooms = [room for room in entries if room.startswith('Area_') and room.endswith('.npy')]
+        raw_area_dirs = [room for room in entries if room.startswith('Area_') and os.path.isdir(os.path.join(data_root, room))]
+        if not rooms:
+            if raw_area_dirs:
+                raise FileNotFoundError(
+                    'Raw S3DIS area directories were found in {}. This loader expects preprocessed room files '
+                    'like Area_1_office_1.npy. Convert the raw dataset first, for example with '
+                    '`python tools/pointnet/prepare_s3dis.py --raw_root <raw_s3dis_root> --output_dir {}`.'.format(
+                        data_root, data_root
+                    )
+                )
+            raise FileNotFoundError(
+                f'No S3DIS room files found in {data_root}. Expected preprocessed files like Area_1_office_1.npy'
+            )
         if split == 'train':
             rooms_split = [room for room in rooms if not 'Area_{}'.format(test_area) in room]
         else:
             rooms_split = [room for room in rooms if 'Area_{}'.format(test_area) in room]
+        if not rooms_split:
+            raise FileNotFoundError(
+                f'No preprocessed S3DIS room files matched split={split!r} with test_area={test_area} in {data_root}'
+            )
 
         self.room_points, self.room_labels = [], []
         self.room_coord_min, self.room_coord_max = [], []
@@ -93,15 +112,20 @@ class ScannetDatasetWholeScene():
         self.stride = stride
         self.scene_points_num = []
         assert split in ['train', 'test']
+        all_files = sorted([d for d in os.listdir(root) if d.startswith('Area_') and d.endswith('.npy')])
         if self.split == 'train':
-            self.file_list = [d for d in os.listdir(root) if d.find('Area_%d' % test_area) is -1]
+            self.file_list = [d for d in all_files if d.find('Area_%d' % test_area) == -1]
         else:
-            self.file_list = [d for d in os.listdir(root) if d.find('Area_%d' % test_area) is not -1]
+            self.file_list = [d for d in all_files if d.find('Area_%d' % test_area) != -1]
+        if not self.file_list:
+            raise FileNotFoundError(
+                f'No preprocessed S3DIS room files matched split={split!r} with test_area={test_area} in {root}'
+            )
         self.scene_points_list = []
         self.semantic_labels_list = []
         self.room_coord_min, self.room_coord_max = [], []
         for file in self.file_list:
-            data = np.load(root + file)
+            data = np.load(os.path.join(root, file))
             points = data[:, :3]
             self.scene_points_list.append(data[:, :6])
             self.semantic_labels_list.append(data[:, 6])
@@ -171,7 +195,7 @@ class ScannetDatasetWholeScene():
         return len(self.scene_points_list)
 
 if __name__ == '__main__':
-    data_root = '/data/yxu/PointNonLocal/data/stanford_indoor3d/'
+    data_root = r'E:\dataset\3d\Stanford3dDataset_v1.2_Aligned_Version'
     num_point, test_area, block_size, sample_rate = 4096, 5, 1.0, 0.01
 
     point_data = S3DISDataset(split='train', data_root=data_root, num_point=num_point, test_area=test_area, block_size=block_size, sample_rate=sample_rate, transform=None)

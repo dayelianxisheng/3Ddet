@@ -89,7 +89,8 @@ class PointNetEncoder(nn.Module):
 
     def forward(self,x):
         B,D,N = x.size()
-        trans = self.stn(x)
+        # Spatial transform is defined on XYZ only; extra channels are concatenated back after alignment.
+        trans = self.stn(x[:, :3, :])
         x = x.transpose(1,2)
         if D>3:
             feature =x[:,:,3:] # 剥离出 3 维以后的特征
